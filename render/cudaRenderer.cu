@@ -2,11 +2,16 @@
 #include <algorithm>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <vector>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_functions.h>
+
+#include <thrust/device_ptr.h>
+#include <thrust/scan.h>
+#include <thrust/sort.h>
 
 #include "cudaRenderer.h"
 #include "image.h"
@@ -56,6 +61,30 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
 #include "circleBoxTest.cu_inl"
+
+#define RENDER_TILE_WIDTH 16
+#define RENDER_TILE_HEIGHT 16
+
+// cudaMalloc failures must be handled immediately.  Otherwise CUDA may keep
+// running with a null device pointer and report a misleading correctness or
+// illegal-memory-access error later.
+template <typename T>
+static void
+checkedCudaMalloc(T** pointer, size_t elementCount, const char* bufferName) {
+    if (elementCount == 0) {
+        *pointer = NULL;
+        return;
+    }
+
+    const size_t bytes = sizeof(T) * elementCount;
+    cudaError_t status = cudaMalloc((void**)pointer, bytes);
+    if (status != cudaSuccess) {
+        fprintf(stderr,
+                "CUDA allocation failed for %s (%zu bytes): %s\n",
+                bufferName, bytes, cudaGetErrorString(status));
+        exit(EXIT_FAILURE);
+    }
+}
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -374,65 +403,141 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     *imagePtr = newColor;
 }
 
-// kernelRenderPixels -- (CUDA device code)
-//
-// Each thread owns one output pixel.  It performs the circle loop in
-// input order, so no two threads ever update the same pixel and alpha
-// blending has the same order as the CPU reference renderer.
-__global__ void kernelRenderPixels() {
+// Computes a conservative rectangle of tiles touched by a circle.  The
+// circleInBox test below removes corner tiles that the circle cannot reach.
+__device__ __inline__ bool
+circleTileBounds(float3 position, float radius,
+                 int numTilesX, int numTilesY,
+                 int& minTileX, int& maxTileX,
+                 int& minTileY, int& maxTileY) {
+    const int imageWidth = cuConstRendererParams.imageWidth;
+    const int imageHeight = cuConstRendererParams.imageHeight;
+
+    const float minPixelX = (position.x - radius) * imageWidth;
+    const float maxPixelX = (position.x + radius) * imageWidth;
+    const float minPixelY = (position.y - radius) * imageHeight;
+    const float maxPixelY = (position.y + radius) * imageHeight;
+
+    if (maxPixelX < 0.f || minPixelX >= imageWidth ||
+        maxPixelY < 0.f || minPixelY >= imageHeight) {
+        return false;
+    }
+
+    minTileX = max(0, static_cast<int>(floorf(minPixelX)) / RENDER_TILE_WIDTH);
+    maxTileX = min(numTilesX - 1,
+                   static_cast<int>(floorf(maxPixelX)) / RENDER_TILE_WIDTH);
+    minTileY = max(0, static_cast<int>(floorf(minPixelY)) / RENDER_TILE_HEIGHT);
+    maxTileY = min(numTilesY - 1,
+                   static_cast<int>(floorf(maxPixelY)) / RENDER_TILE_HEIGHT);
+    return minTileX <= maxTileX && minTileY <= maxTileY;
+}
+
+__device__ __inline__ bool
+circleTouchesTile(float3 position, float radius, int tileX, int tileY) {
+    const float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    const float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    const float boxL = tileX * RENDER_TILE_WIDTH * invWidth;
+    const float boxR = min((tileX + 1) * RENDER_TILE_WIDTH,
+                           cuConstRendererParams.imageWidth) * invWidth;
+    const float boxB = tileY * RENDER_TILE_HEIGHT * invHeight;
+    const float boxT = min((tileY + 1) * RENDER_TILE_HEIGHT,
+                           cuConstRendererParams.imageHeight) * invHeight;
+    return circleInBox(position.x, position.y, radius,
+                       boxL, boxR, boxT, boxB) != 0;
+}
+
+// One thread counts the tile pairs emitted by one circle.
+__global__ void
+kernelCountCircleTiles(int numTilesX, int numTilesY, int* circleTileCounts) {
+    const int circle = blockIdx.x * blockDim.x + threadIdx.x;
+    if (circle >= cuConstRendererParams.numCircles) return;
+
+    const int index3 = 3 * circle;
+    const float3 position =
+        *(float3*)(&cuConstRendererParams.position[index3]);
+    const float radius = cuConstRendererParams.radius[circle];
+
+    int minTileX, maxTileX, minTileY, maxTileY;
+    if (!circleTileBounds(position, radius, numTilesX, numTilesY,
+                          minTileX, maxTileX, minTileY, maxTileY)) {
+        circleTileCounts[circle] = 0;
+        return;
+    }
+
+    int count = 0;
+    for (int tileY = minTileY; tileY <= maxTileY; ++tileY) {
+        for (int tileX = minTileX; tileX <= maxTileX; ++tileX) {
+            count += circleTouchesTile(position, radius, tileX, tileY);
+        }
+    }
+    circleTileCounts[circle] = count;
+}
+
+// Each circle owns a range assigned by the preceding exclusive scan, so pair
+// writes are conflict-free and initially ordered by circle index.
+__global__ void
+kernelEmitCircleTilePairs(int numTilesX, int numTilesY,
+                          const int* circlePairOffsets,
+                          int* pairTileIds, int* pairCircleIds,
+                          int* tileCounts) {
+    const int circle = blockIdx.x * blockDim.x + threadIdx.x;
+    if (circle >= cuConstRendererParams.numCircles) return;
+
+    const int index3 = 3 * circle;
+    const float3 position =
+        *(float3*)(&cuConstRendererParams.position[index3]);
+    const float radius = cuConstRendererParams.radius[circle];
+
+    int minTileX, maxTileX, minTileY, maxTileY;
+    if (!circleTileBounds(position, radius, numTilesX, numTilesY,
+                          minTileX, maxTileX, minTileY, maxTileY)) {
+        return;
+    }
+
+    int output = circlePairOffsets[circle];
+    for (int tileY = minTileY; tileY <= maxTileY; ++tileY) {
+        for (int tileX = minTileX; tileX <= maxTileX; ++tileX) {
+            if (!circleTouchesTile(position, radius, tileX, tileY)) continue;
+
+            const int tile = tileY * numTilesX + tileX;
+            pairTileIds[output] = tile;
+            pairCircleIds[output] = circle;
+            atomicAdd(&tileCounts[tile], 1);
+            ++output;
+        }
+    }
+}
+
+// Each thread owns one output pixel.  Candidate circles have been grouped by
+// tile with a stable sort, so this loop observes original circle input order.
+__global__ void
+kernelRenderPixels(const int* tileStarts, const int* tileCircleIds,
+                   int numTilesX) {
     const int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     const int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
     const int imageWidth = cuConstRendererParams.imageWidth;
     const int imageHeight = cuConstRendererParams.imageHeight;
-    const bool inBounds = pixelX < imageWidth && pixelY < imageHeight;
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
 
-    // Every thread must participate in the barriers below, including
-    // out-of-bounds threads in a partially filled edge tile.
-    __shared__ float3 tileCirclePosition;
-    __shared__ float tileCircleRadius;
-    __shared__ int circleIntersectsTile;
-
-    // clearImage() established the scene's background.  Keep the running
-    // color in a register and store it once after all contributions.
-    float4 pixelColor;
-    if (inBounds) {
-        const int offset = 4 * (pixelY * imageWidth + pixelX);
-        pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
-    }
+    const int offset = 4 * (pixelY * imageWidth + pixelX);
+    float4* imagePtr = (float4*)(&cuConstRendererParams.imageData[offset]);
+    float4 pixelColor = *imagePtr;
     const float2 pixelCenter = make_float2(
         (static_cast<float>(pixelX) + 0.5f) / imageWidth,
         (static_cast<float>(pixelY) + 0.5f) / imageHeight);
 
-    const float boxL = (blockIdx.x * blockDim.x) / static_cast<float>(imageWidth);
-    const float boxR = min((blockIdx.x + 1) * blockDim.x, imageWidth) /
-                       static_cast<float>(imageWidth);
-    const float boxB = (blockIdx.y * blockDim.y) / static_cast<float>(imageHeight);
-    const float boxT = min((blockIdx.y + 1) * blockDim.y, imageHeight) /
-                       static_cast<float>(imageHeight);
-
-    for (int circle = 0; circle < cuConstRendererParams.numCircles; ++circle) {
-        // Load one circle and classify it once per tile, rather than once
-        // for every pixel.  The outer loop is in input order by design.
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            const int index3 = 3 * circle;
-            tileCirclePosition = *(float3*)(&cuConstRendererParams.position[index3]);
-            tileCircleRadius = cuConstRendererParams.radius[circle];
-            circleIntersectsTile = circleInBox(
-                tileCirclePosition.x, tileCirclePosition.y, tileCircleRadius,
-                boxL, boxR, boxT, boxB);
-        }
-        __syncthreads();
-
-        if (inBounds && circleIntersectsTile) {
-            shadePixel(circle, pixelCenter, tileCirclePosition, &pixelColor);
-        }
-        __syncthreads();
+    const int tile = blockIdx.y * numTilesX + blockIdx.x;
+    const int begin = tileStarts[tile];
+    const int end = tileStarts[tile + 1];
+    for (int i = begin; i < end; ++i) {
+        const int circle = tileCircleIds[i];
+        const int index3 = 3 * circle;
+        const float3 position =
+            *(float3*)(&cuConstRendererParams.position[index3]);
+        shadePixel(circle, pixelCenter, position, &pixelColor);
     }
 
-    if (inBounds) {
-        const int offset = 4 * (pixelY * imageWidth + pixelX);
-        *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
-    }
+    *imagePtr = pixelColor;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -452,6 +557,14 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceColor = NULL;
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
+
+    cudaDeviceCircleTileCounts = NULL;
+    cudaDeviceCirclePairOffsets = NULL;
+    cudaDeviceTileCounts = NULL;
+    cudaDeviceTileStarts = NULL;
+    cudaDevicePairTileIds = NULL;
+    cudaDevicePairCircleIds = NULL;
+    pairCapacity = 0;
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -473,6 +586,12 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
+        cudaFree(cudaDeviceCircleTileCounts);
+        cudaFree(cudaDeviceCirclePairOffsets);
+        cudaFree(cudaDeviceTileCounts);
+        cudaFree(cudaDeviceTileStarts);
+        cudaFree(cudaDevicePairTileIds);
+        cudaFree(cudaDevicePairCircleIds);
     }
 }
 
@@ -528,11 +647,40 @@ CudaRenderer::setup() {
     // See the CUDA Programmer's Guide for descriptions of
     // cudaMalloc and cudaMemcpy
 
-    cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numCircles);
-    cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numCircles);
-    cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
-    cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
-    cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
+    checkedCudaMalloc(&cudaDevicePosition,
+                      static_cast<size_t>(3) * numCircles,
+                      "circle positions");
+    checkedCudaMalloc(&cudaDeviceVelocity,
+                      static_cast<size_t>(3) * numCircles,
+                      "circle velocities");
+    checkedCudaMalloc(&cudaDeviceColor,
+                      static_cast<size_t>(3) * numCircles,
+                      "circle colors");
+    checkedCudaMalloc(&cudaDeviceRadius,
+                      static_cast<size_t>(numCircles),
+                      "circle radii");
+    checkedCudaMalloc(&cudaDeviceImageData,
+                      static_cast<size_t>(4) * image->width * image->height,
+                      "output image");
+
+    const int numTilesX =
+        (image->width + RENDER_TILE_WIDTH - 1) / RENDER_TILE_WIDTH;
+    const int numTilesY =
+        (image->height + RENDER_TILE_HEIGHT - 1) / RENDER_TILE_HEIGHT;
+    const int numTiles = numTilesX * numTilesY;
+    const int circleBufferSize = max(1, numCircles);
+    checkedCudaMalloc(&cudaDeviceCircleTileCounts,
+                      static_cast<size_t>(circleBufferSize),
+                      "circle tile counts");
+    checkedCudaMalloc(&cudaDeviceCirclePairOffsets,
+                      static_cast<size_t>(circleBufferSize),
+                      "circle pair offsets");
+    checkedCudaMalloc(&cudaDeviceTileCounts,
+                      static_cast<size_t>(numTiles),
+                      "tile counts");
+    checkedCudaMalloc(&cudaDeviceTileStarts,
+                      static_cast<size_t>(numTiles) + 1,
+                      "tile starts");
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
@@ -644,11 +792,79 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    const dim3 blockDim(16, 16, 1);
-    const dim3 gridDim(
-        (image->width + blockDim.x - 1) / blockDim.x,
-        (image->height + blockDim.y - 1) / blockDim.y);
+    // clearImage() has already produced the complete result for an empty scene.
+    if (numCircles == 0) return;
 
-    kernelRenderPixels<<<gridDim, blockDim>>>();
+    const int numTilesX =
+        (image->width + RENDER_TILE_WIDTH - 1) / RENDER_TILE_WIDTH;
+    const int numTilesY =
+        (image->height + RENDER_TILE_HEIGHT - 1) / RENDER_TILE_HEIGHT;
+    const int numTiles = numTilesX * numTilesY;
+
+    const int circleThreads = 256;
+    const int circleBlocks = (numCircles + circleThreads - 1) / circleThreads;
+
+    // In parallel, determine how many (tile, circle) pairs each circle contributes.
+    // A scan then gives every circle a conflict-free range.
+    kernelCountCircleTiles<<<circleBlocks, circleThreads>>>(
+        numTilesX, numTilesY, cudaDeviceCircleTileCounts);
+
+    thrust::device_ptr<int> circleCounts(cudaDeviceCircleTileCounts);
+    thrust::device_ptr<int> circleOffsets(cudaDeviceCirclePairOffsets);
+    thrust::exclusive_scan(
+        circleCounts, circleCounts + numCircles, circleOffsets);
+
+    int lastCount;
+    int lastOffset;
+    cudaMemcpy(&lastCount,
+               cudaDeviceCircleTileCounts + numCircles - 1,
+               sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&lastOffset,
+               cudaDeviceCirclePairOffsets + numCircles - 1,
+               sizeof(int), cudaMemcpyDeviceToHost);
+    const int pairCount = lastOffset + lastCount;
+
+    // Pair buffers grow on demand and are reused by subsequent frames.
+    if (pairCount > pairCapacity) {
+        cudaFree(cudaDevicePairTileIds);
+        cudaFree(cudaDevicePairCircleIds);
+        pairCapacity = pairCount + pairCount / 4 + 1;
+        checkedCudaMalloc(&cudaDevicePairTileIds,
+                          static_cast<size_t>(pairCapacity),
+                          "pair tile IDs");
+        checkedCudaMalloc(&cudaDevicePairCircleIds,
+                          static_cast<size_t>(pairCapacity),
+                          "pair circle IDs");
+    }
+
+    // Emit pairs in circle order, count entries per tile, then stable-sort
+    // by tile.  Stability preserves circle input order inside every tile.
+    cudaMemset(cudaDeviceTileCounts, 0, sizeof(int) * numTiles);
+    if (pairCount > 0) {
+        kernelEmitCircleTilePairs<<<circleBlocks, circleThreads>>>(
+            numTilesX, numTilesY,
+            cudaDeviceCirclePairOffsets,
+            cudaDevicePairTileIds,
+            cudaDevicePairCircleIds,
+            cudaDeviceTileCounts);
+
+        thrust::device_ptr<int> pairTileIds(cudaDevicePairTileIds);
+        thrust::device_ptr<int> pairCircleIds(cudaDevicePairCircleIds);
+        thrust::stable_sort_by_key(
+            pairTileIds, pairTileIds + pairCount, pairCircleIds);
+    }
+
+    // Scan tile counts into offsets. tileStarts[tile:tile+2] is the
+    // candidate range consumed by all pixels in that tile.
+    thrust::device_ptr<int> tileCounts(cudaDeviceTileCounts);
+    thrust::device_ptr<int> tileStarts(cudaDeviceTileStarts);
+    thrust::exclusive_scan(tileCounts, tileCounts + numTiles, tileStarts);
+    cudaMemcpy(cudaDeviceTileStarts + numTiles,
+               &pairCount, sizeof(int), cudaMemcpyHostToDevice);
+
+    const dim3 blockDim(RENDER_TILE_WIDTH, RENDER_TILE_HEIGHT, 1);
+    const dim3 gridDim(numTilesX, numTilesY, 1);
+    kernelRenderPixels<<<gridDim, blockDim>>>(
+        cudaDeviceTileStarts, cudaDevicePairCircleIds, numTilesX);
     cudaDeviceSynchronize();
 }

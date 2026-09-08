@@ -20,6 +20,14 @@ class CudaRenderer : public CircleRenderer {
   float* cudaDeviceRadius;
   float* cudaDeviceImageData;
 
+  int* cudaDeviceCircleTileCounts;
+  int* cudaDeviceCirclePairOffsets;
+  int* cudaDeviceTileCounts;
+  int* cudaDeviceTileStarts;
+  int* cudaDevicePairTileIds;
+  int* cudaDevicePairCircleIds;
+  int pairCapacity;
+
  public:
   CudaRenderer();
   virtual ~CudaRenderer();
