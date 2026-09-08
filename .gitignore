@@ -3,6 +3,9 @@
 **/logs/
 **/cudaScan
 **/cudaSaxpy
+/render/render
+**/output_*.ppm
+**/output_*.png
 
 # Local CUDA installer package
 *.deb
